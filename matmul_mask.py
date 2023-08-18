@@ -7,15 +7,6 @@ import time
 
 @cuda.jit(device=True)
 def warpReduceSum(acc, warp_size=32):
-    """
-    accumulate values in the same warp thread
-    with Warp-Level Primitives
-    the result will in the first thread in every warp
-    more detail see: https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/
-    :param acc:
-    :param warp_size:
-    :return:
-    """
     offset = warp_size
     while offset > 1:
         offset = offset // 2
@@ -74,12 +65,9 @@ def matmul_with_mask_forward_kernel(output, a, bt, mask_idxs):
         # this implement could avoid to use share cuda memory
         accumulate = warpReduceSum(accumulate, warp_size)
 
-        # after warp reduce, the result is in first thread in warp
         if cuda.threadIdx.x % 32 == 0:
-            # use atomic add to avoid thread race
+            # after warp reduce, the result is in first thread in warp
             cuda.atomic.add(output, tid, accumulate)
-            # we don't need to synchronize threads
-            # because every thread in different block handle output data independently
 
         # if cuda.threadIdx.x == 0:
         #     # after warp reduce, the result is in first thread in warp
@@ -98,15 +86,20 @@ def matmul_with_mask_backward_kernel(
 
     tid = cuda.blockIdx.x
     while tid < nnz:
-        # mask_idxs: [nnz, 3]：[B, N1, N2] indices of non-zero element
+        # [nnz, 3]：[B, N1, N2]上的坐标
         batch_id = mask_idxs[tid, 0]
         N1_id = mask_idxs[tid, 1]
         N2_id = mask_idxs[tid, 2]
 
         ch_id = cuda.threadIdx.x
         while ch_id < Ch:
-            grad_a[batch_id, N1_id, ch_id] = grad_output[tid] * bt[batch_id, N2_id, ch_id]
-            grad_bt[batch_id, N2_id, ch_id] = grad_output[tid] * a[batch_id, N1_id, ch_id]
+            # note: 这里必须累加，而且还要解决冲突问题啊
+            cuda.atomic.add(grad_a, (batch_id, N1_id, ch_id),
+                            grad_output[tid] * bt[batch_id, N2_id, ch_id])
+            cuda.atomic.add(grad_bt, (batch_id, N2_id, ch_id),
+                            grad_output[tid] * a[batch_id, N1_id, ch_id])
+            # grad_a[batch_id, N1_id, ch_id] += grad_output[tid] * bt[batch_id, N2_id, ch_id]
+            # grad_bt[batch_id, N2_id, ch_id] += grad_output[tid] * a[batch_id, N1_id, ch_id]
             ch_id += cuda.blockDim.x
 
         tid += cuda.gridDim.x
@@ -116,7 +109,7 @@ class MatMultWithMask(Function):
     """
     Inherits from torch.autograd.Function
     and (forward) implements masked matrix multiplication
-    and (backward) sparse back gradient computation.
+    and (backward) sparse gradient computation.
     """
 
     @staticmethod
@@ -145,6 +138,8 @@ class MatMultWithMask(Function):
         cuda_mask_indx = cuda.as_cuda_array(mask_indx)
         nnz = mask_indx.size(0)
 
+        # ctx.
+        ctx.mark_non_differentiable(mask_indx)
         ctx.save_for_backward(a, bt, mask_indx)
 
         # the output should init to zero
@@ -155,14 +150,9 @@ class MatMultWithMask(Function):
 
         # note:We create a one-dimensional grid of length nnz
         #      that does not exceed MAX_GRID_DIM_X to handle the non-zero elements.
-        #      we create a one-dimensional thread block
-        #      with a length slightly larger than
-        #      the channel dimension of matrix A
-        #      and a multiple of 32, which does not exceed the MAX_THREADS_PER_BLOCK,
+        #      And we use thread blocks of length 32 (one warp length)
         #      to handle the channel dimension of the data.
-        grids = (min(nnz, cuda.get_current_device().MAX_GRID_DIM_X),)
-        blocks = (min(int(math.ceil(a.size(-1) / 32) * 32),
-                      cuda.get_current_device().MAX_THREADS_PER_BLOCK),)
+        grids, blocks = (min(nnz, cuda.get_current_device().MAX_GRID_DIM_X),), (1024,)
         stream = cuda.stream()
         matmul_with_mask_forward_kernel[grids, blocks, stream](cuda_output,
                                                                cuda_a, cuda_bt,
@@ -191,14 +181,11 @@ class MatMultWithMask(Function):
 
         # note:We create a one-dimensional grid of length nnz
         #      that does not exceed MAX_GRID_DIM_X to handle the non-zero elements.
-        #      we create a one-dimensional thread block
-        #      with a length slightly larger than
-        #      the channel dimension of matrix A
-        #      and a multiple of 32, which does not exceed the MAX_THREADS_PER_BLOCK,
+        #      We create a thread block with the same length as the channel dimension
+        #         (not exceed MAX_THREADS_PER_BLOCK)
         #      to handle the channel dimension of the data.
         grids = (min(nnz, cuda.get_current_device().MAX_GRID_DIM_X),)
-        blocks = (min(int(math.ceil(a.size(-1) / 32) * 32),
-                      cuda.get_current_device().MAX_THREADS_PER_BLOCK),)
+        blocks = (min(a.size(-1), cuda.get_current_device().MAX_THREADS_PER_BLOCK),)
         stream = cuda.stream()
 
         matmul_with_mask_backward_kernel[grids, blocks, stream](cuda_grad_a, cuda_grad_bt,
@@ -206,18 +193,17 @@ class MatMultWithMask(Function):
                                                                 cuda_a, cuda_bt,
                                                                 cuda_mask_indx)
         grad_b = grad_bt.transpose(-1, -2).contiguous()
-
-        # we don't care the gradient of indices
         return grad_a, grad_b, None
 
 
 #
 
-def matmul_with_mask(a, b, mask):
+def matmul_with_mask(a, b, mask, value_only=False):
     """
     - Batched matrix multiplication with a sparse mask
     that marks which elements of the tensors a and b should be multiplied.
     - This function outputs a sparse result and can automatically compute gradients.
+    :param value_only: 只返回value
     :param a: dence tensor [B, N1, C]
     :param b: dence tensor [B, C, N2]
     :param mask: sparse tensor [B, N1, N2],
@@ -229,6 +215,8 @@ def matmul_with_mask(a, b, mask):
     assert b.dim() == 3
     assert a.size(-1) == b.size(-2)  # matrix multiplication
     assert a.size(0) == b.size(0)  # batch dimension should be same
+    assert a.size(-2) == mask.size(-2)
+    assert b.size(-1) == mask.size(-1)
     assert a.is_cuda
     assert b.is_cuda
     assert mask.is_cuda
@@ -236,9 +224,13 @@ def matmul_with_mask(a, b, mask):
 
     B, N1, N2 = mask.size()
     values, indexs = MatMultWithMask.apply(a, b, mask)
-    sparse_c = torch.sparse_coo_tensor(values=values,
-                                       indices=indexs, size=(B, N1, N2))
-    return sparse_c
+
+    if value_only:
+        return values
+    else:
+        sparse_c = torch.sparse_coo_tensor(values=values,
+                                           indices=indexs, size=(B, N1, N2))
+        return sparse_c.coalesce()
 
 
 if __name__ == "__main__":
@@ -250,22 +242,30 @@ if __name__ == "__main__":
     a = torch.rand(B, H, C, requires_grad=True, dtype=torch.float).cuda()
     b = torch.rand(B, C, W, requires_grad=True, dtype=torch.float).cuda()
 
-    #
-    mask_p = torch.rand(B, H, W)
+    # 生成形状为(2, 3)的随机张量，元素值在[0, 1)范围内
+    mask_prob = torch.rand(B, H, W)
 
-    #
-    mask_dence = torch.where(mask_p >= 0.5,
-                             torch.ones_like(mask_p),
-                             torch.zeros_like(mask_p))
-
-    mask_dence = mask_dence.requires_grad_()
-
-    mask = mask_dence.to_sparse_coo().cuda()
+    # 将大于等于0.5的元素设置为1，其余元素设置为0
+    mask_dense = mask_prob >= 0.5
+    mask = mask_dense.to_sparse_coo().cuda()
 
     c = matmul_with_mask(a, b, mask)
-    pass
-    loss = c.sum()
-    loss.backward()
-    pass
-    #
+    dense_c = c.to_dense()
 
+    # 用密集运算的结果进行测试
+    check_c = torch.bmm(a, b)
+    check_c[~mask_dense] = 0
+
+    print("前向运算结果正确测试：", torch.allclose(dense_c, check_c))
+    pass
+    grad_a, grad_b = torch.autograd.grad(c.sum(), (a, b))
+    pass
+    # 测试grad_a的正确性
+    init_grad_o = torch.ones_like(dense_c)
+    init_grad_o[~mask_dense] = 0
+    check_grad_a = torch.bmm(init_grad_o, b.permute(0, 2, 1))
+    print("后向运算grad_a结果正确测试：", torch.allclose(grad_a, check_grad_a))
+
+    # 测试grad_b的正确性
+    check_grad_b = torch.bmm(init_grad_o.permute(0, 2, 1), a).permute(0, 2, 1)
+    print("后向运算grad_b结果正确测试：", torch.allclose(grad_b, check_grad_b))
