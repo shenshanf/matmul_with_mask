@@ -1,7 +1,5 @@
 import torch
-from modules.opts.matmul_mask import matmul_with_mask
-import numba.cuda as cuda
-# import xformers
+from matmul_mask import matmul_with_mask
 
 
 class SparseBMM(torch.autograd.Function):
